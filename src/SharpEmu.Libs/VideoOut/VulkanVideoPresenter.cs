@@ -11257,10 +11257,23 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private static readonly bool _skipAllDraws =
+            Environment.GetEnvironmentVariable("SHARPEMU_SKIP_ALL_DRAWS") == "1";
+
         private void ExecuteOffscreenDraw(VulkanOffscreenGuestDraw work)
         {
             if (_deviceLost || work.Targets.Count == 0)
             {
+                return;
+            }
+
+            // Temporary bisection diagnostic for #639: SHARPEMU_SKIP_ALL_COMPUTE
+            // was tested and retracted (multi-trial averaging showed it made the
+            // leak worse, not better - see issue comments). Trying the draw path
+            // next with the same rigor.
+            if (_skipAllDraws)
+            {
+                ReturnPooledGuestData(work.Draw);
                 return;
             }
 
