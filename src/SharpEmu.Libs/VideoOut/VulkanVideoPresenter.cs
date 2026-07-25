@@ -5116,8 +5116,51 @@ internal static unsafe class VulkanVideoPresenter
             SubmitGuestCommandBuffer(commandBuffer, [], []);
         }
 
+        private static readonly bool _logGpuQueueDepth =
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_GPU_QUEUE_DEPTH") == "1";
+        private long _lastGpuQueueDepthLogTicks;
+
+        // Temporary diagnostic for #639: the per-frame capacity wait
+        // (_submissionCapacityWaitNs) never logs on timeout by design (see
+        // CollectCompletedGuestSubmissions), so a backed-up queue is otherwise
+        // invisible until the process runs out of memory. This reports the
+        // real queue depth and the native resources riding along with it
+        // (each pending submission owns undestroyed buffers/pools until its
+        // fence collects) directly, independent of whether any timeout fires.
+        private void LogGpuQueueDepthIfDue()
+        {
+            if (!_logGpuQueueDepth)
+            {
+                return;
+            }
+
+            var now = Stopwatch.GetTimestamp();
+            if (_lastGpuQueueDepthLogTicks != 0 &&
+                Stopwatch.GetElapsedTime(_lastGpuQueueDepthLogTicks, now).TotalSeconds < 2.0)
+            {
+                return;
+            }
+
+            _lastGpuQueueDepthLogTicks = now;
+            var retireBufferTotal = 0;
+            var retirePoolTotal = 0;
+            foreach (var submission in _pendingGuestSubmissions)
+            {
+                retireBufferTotal += submission.RetireBuffers.Count;
+                retirePoolTotal += submission.RetirePools.Count;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.gpu_queue_depth pending_submissions={_pendingGuestSubmissions.Count} " +
+                $"recycled_fences={_recycledGuestFences.Count} " +
+                $"recycled_command_buffers={_recycledGuestCommandBuffers.Count} " +
+                $"retire_buffers_riding={retireBufferTotal} retire_pools_riding={retirePoolTotal} " +
+                $"pending_work_count={_pendingGuestWorkCount} pending_work_mb={_pendingGuestWorkBytes / (1024 * 1024)}");
+        }
+
         private void EnsureGuestSubmissionCapacity()
         {
+            LogGpuQueueDepthIfDue();
             CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {
