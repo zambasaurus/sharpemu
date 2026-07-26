@@ -38,6 +38,50 @@ public sealed partial class DirectExecutionBackend
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
 
+	// A title polling either a genuinely missing HLE export or an implemented
+	// one that keeps returning a persistent non-OK result (e.g. retrying
+	// sceSaveDataDialogInitialize because it never sees a state it accepts)
+	// does so with zero backoff on our side: it retries as fast as the CPU
+	// allows, and whatever the guest's own retry loop allocates per attempt
+	// grows unbounded in lockstep (see #619 - observed ~17GB -> ~40GB in
+	// under a minute). Past a threshold, sleep briefly so the loop is still
+	// eventually responsive (the guest keeps getting a real answer) but can
+	// no longer spin fast enough to exhaust memory. This is deliberately
+	// generic to any NID, not specific to the one that surfaced it.
+	private const int ImportRetryThrottleThreshold = 200;
+	private static readonly TimeSpan ImportRetryThrottleDelay = TimeSpan.FromMilliseconds(2);
+
+	/// <summary>
+	/// Counts occurrences of <paramref name="key"/> (some per-NID/per-outcome
+	/// identifier) and reports whether this occurrence should be logged -
+	/// generously at first so a genuinely new failure is visible, then
+	/// falling back to periodic sampling once it's clearly a repeating
+	/// pattern rather than a one-off. Shares <see cref="_importResultLogSamples"/>
+	/// with <see cref="ShouldLogImportResult"/> since both are the same kind
+	/// of "this keeps happening" bookkeeping.
+	/// </summary>
+	private int TrackRepeatedImportOutcome(string key, int logGenerouslyThreshold, out bool shouldLog)
+	{
+		int count;
+		lock (_importResultLogSampleGate)
+		{
+			_importResultLogSamples.TryGetValue(key, out count);
+			count++;
+			_importResultLogSamples[key] = count;
+		}
+
+		shouldLog = count <= logGenerouslyThreshold || count % 10000 == 0;
+		return count;
+	}
+
+	private static void ThrottleIfRepeatedImportRetry(int occurrenceCount)
+	{
+		if (occurrenceCount > ImportRetryThrottleThreshold)
+		{
+			Thread.Sleep(ImportRetryThrottleDelay);
+		}
+	}
+
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
 		try
@@ -555,9 +599,23 @@ public sealed partial class DirectExecutionBackend
 				{
 					DumpIl2CppExceptionDiagnostic(cpuContext, value, num7);
 				}
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
-					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
+
+				// A title polling a genuinely missing HLE export in a tight
+				// loop has nothing to back off against on its own side - see
+				// #619. Log generously up front, then fall back to periodic
+				// sampling, and throttle once it's clearly an unbounded spin
+				// rather than a one-off probe.
+				var unresolvedOccurrence = TrackRepeatedImportOutcome(
+					"unresolved\0" + importStubEntry.Nid, logGenerouslyThreshold: 50, out var shouldLogUnresolved);
+				if (shouldLogUnresolved)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16} " +
+						$"occurrence={unresolvedOccurrence}");
+				}
+
+				ThrottleIfRepeatedImportRetry(unresolvedOccurrence);
 				if (importStubEntry.Nid == "L-Q3LEjIbgA")
 				{
 					string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)
@@ -576,11 +634,12 @@ public sealed partial class DirectExecutionBackend
 			}
 			else if (orbisGen2Result != OrbisGen2Result.ORBIS_GEN2_OK)
 			{
-				if (ShouldLogImportResult(importStubEntry.Nid, orbisGen2Result))
+				if (ShouldLogImportResult(importStubEntry.Nid, orbisGen2Result, out var resultOccurrence))
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
-						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16} " +
+						$"occurrence={resultOccurrence}");
 				}
 			}
 			cpuContext[CpuRegister.Rbx] = value3;
@@ -1340,14 +1399,14 @@ public sealed partial class DirectExecutionBackend
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
 		{
 			var returnResult = (OrbisGen2Result)returnValue;
-			if (ShouldLogImportResult(importStubEntry.Nid, returnResult))
+			if (ShouldLogImportResult(importStubEntry.Nid, returnResult, out var resultOccurrence))
 			{
 				Console.Error.WriteLine(
 					$"[LOADER][WARN] Import#{dispatchIndex} result: {returnResult} ({importStubEntry.Nid}) " +
 					$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
 					$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
 					$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} " +
-					$"ret=0x{returnRip:X16}");
+					$"ret=0x{returnRip:X16} occurrence={resultOccurrence}");
 			}
 		}
 
@@ -1426,8 +1485,12 @@ public sealed partial class DirectExecutionBackend
 			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
 			"K-jXhbt2gn4";   // scePthreadMutexTrylock
 
-	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
+	private bool ShouldLogImportResult(string nid, OrbisGen2Result result) =>
+		ShouldLogImportResult(nid, result, out _);
+
+	private bool ShouldLogImportResult(string nid, OrbisGen2Result result, out int occurrenceCount)
 	{
+		occurrenceCount = 0;
 		var resultValue = unchecked((int)result);
 		if (resultValue > 0)
 		{
@@ -1461,34 +1524,47 @@ public sealed partial class DirectExecutionBackend
 		var expectedPrivacyInvalidParameter =
 			string.Equals(nid, "D-CzAxQL0XI", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960009);
-		if (!expectedFileProbeMiss &&
-			!expectedTimedWaitTimeout &&
-			!expectedEqueueTimeout &&
-			!expectedMutexTrylockBusy &&
-			!expectedSemaphoreTrywaitAgain &&
-			!expectedPollSemaBusy &&
-			!expectedNetAcceptWouldBlock &&
-			!expectedUserServiceNoEvent &&
-			!expectedPrivacyInvalidParameter)
+		var isExpected =
+			expectedFileProbeMiss ||
+			expectedTimedWaitTimeout ||
+			expectedEqueueTimeout ||
+			expectedMutexTrylockBusy ||
+			expectedSemaphoreTrywaitAgain ||
+			expectedPollSemaBusy ||
+			expectedNetAcceptWouldBlock ||
+			expectedUserServiceNoEvent ||
+			expectedPrivacyInvalidParameter;
+
+		// Track occurrences of *every* repeated non-OK result, not just the
+		// small allowlist below - an outcome that isn't on this list yet is
+		// exactly the kind of thing #619 was filed about (a title retrying an
+		// unexpected persistent error with no backoff on our side). Logging
+		// still favors the allowlist (quieter by default, opt-in via
+		// SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS); everything else logs
+		// generously up front so a genuinely new failure is still visible,
+		// then falls back to the same periodic sampling once it's clearly a
+		// repeating pattern rather than a one-off.
+		occurrenceCount = TrackRepeatedImportOutcome(
+			nid + "\0" + resultValue, isExpected ? 8 : 50, out var shouldLog);
+
+		// Only throttle outcomes NOT on the allowlist. The allowlist exists
+		// precisely because these are known-harmless, often-fast spin
+		// patterns (mutex trylock, semaphore trywait, etc.) that real
+		// hardware also retries quickly and titles rely on retrying at full
+		// speed - injecting a sleep into those would be a real regression,
+		// not a fix. Throttling is for outcomes we don't already know are
+		// fine to spin on.
+		if (!isExpected)
 		{
-			return true;
+			ThrottleIfRepeatedImportRetry(occurrenceCount);
 		}
 
-		if (!ShouldLogExpectedImportResults())
+		if (isExpected && !ShouldLogExpectedImportResults())
 		{
 			return false;
 		}
 
-		var key = nid + "\0" + resultValue;
-		int count;
-		lock (_importResultLogSampleGate)
-		{
-			_importResultLogSamples.TryGetValue(key, out count);
-			count++;
-			_importResultLogSamples[key] = count;
-		}
-
-		return count <= 8 || count % 10000 == 0;
+		return shouldLog;
 	}
 
 	private static bool ShouldLogExpectedImportResults() =>
